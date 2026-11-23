@@ -1,0 +1,57 @@
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Pass 4A (Input Packer for IntelMaskNet @ 1/8 game-res, e.g. 160x90):
+// Reads 1/8-res RG8 luma (prev/curr) + 1/4-res RGBA16F flow/conf/occl, warps luma to t=0.5,
+// quantizes all 8 channels [0, 1] -> int8 [0, 127] with IEEE roundEven(), and packs into 2 int32s/px.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint u_width;  // 1/8-res width (e.g. 160)
+    uint u_height; // 1/8-res height (e.g. 90)
+    uint u_fullW;  // game-res width (e.g. 1280)
+    uint u_fullH;  // game-res height (e.g. 720)
+};
+
+layout(set = 1, binding = 0) uniform sampler2D s_luma8Prev;
+layout(set = 1, binding = 1) uniform sampler2D s_luma8Curr;
+layout(set = 1, binding = 2) uniform sampler2D s_flowField;
+layout(set = 1, std430, binding = 3) writeonly buffer OutInAct { int inAct[]; };
+
+int pack4(float a, float b, float c, float d)
+{
+    int qa = clamp(int(roundEven(clamp(a, 0.0, 1.0) * 127.0)), 0, 127);
+    int qb = clamp(int(roundEven(clamp(b, 0.0, 1.0) * 127.0)), 0, 127);
+    int qc = clamp(int(roundEven(clamp(c, 0.0, 1.0) * 127.0)), 0, 127);
+    int qd = clamp(int(roundEven(clamp(d, 0.0, 1.0) * 127.0)), 0, 127);
+    return (qa & 0xFF) | ((qb & 0xFF) << 8) | ((qc & 0xFF) << 16) | ((qd & 0xFF) << 24);
+}
+
+void main()
+{
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    if (ox >= u_width || oy >= u_height)
+        return;
+
+    vec2 uv = (vec2(ox, oy) + 0.5) / vec2(u_width, u_height);
+    vec2 invFull = 1.0 / vec2(u_fullW, u_fullH);
+
+    float l0 = textureLod(s_luma8Prev, uv, 0.0).r;
+    float l1 = textureLod(s_luma8Curr, uv, 0.0).r;
+    vec4 flow = textureLod(s_flowField, uv, 0.0); // xy = full-res px, z = conf, w = occl
+
+    vec2 h = flow.xy * 0.5 * invFull;
+    float w0 = textureLod(s_luma8Prev, clamp(uv - h, 0.0, 1.0), 0.0).r;
+    float w1 = textureLod(s_luma8Curr, clamp(uv + h, 0.0, 1.0), 0.0).r;
+
+    // Consistent /16.0 flow normalization in 1/8-res pixel units (full_px / 8 / 16 = full_px / 128)
+    float fx = abs(flow.x) * (1.0 / 128.0);
+    float fy = abs(flow.y) * (1.0 / 128.0);
+
+    uint base = (oy * u_width + ox) * 2u; // 8 channels = 2 int32s
+    inAct[base + 0u] = pack4(l0, l1, w0, w1);
+    inAct[base + 1u] = pack4(fx, fy, flow.z, flow.w);
+}

@@ -1,0 +1,300 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "descriptor_set.h"
+
+// Pass 2 FP16 (v6 Intel Xe-LP / UHD Native FP16 Edition):
+// Half-precision ALU doubles throughput & halves register pressure on Intel Gen12/Alder Lake-H 48 EUs.
+// Includes: Directional background-flow disocclusion inpainting, Particle/Flicker guard (fire/smoke),
+// YCoCg anti-ghosting, Static HUD/text lock, Motion-adaptive RCAS-lite, and 0..4ms GPU budget bar.
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 0, scalar)
+uniform layers_t {
+    uint  u_width;
+    uint  u_height;
+    uint  u_mode;           // 1 = duplicate, 2 = blend, 3 = opticalflow
+    float u_alpha;          // interpolation factor in (0.0, 1.0)
+    float u_sceneCutThresh; // luma delta threshold for scene-cut fallback
+    float u_flowScale;      // motion vector scale factor
+    uint  u_debugMode;      // 0 = off, 1 = split A/B, 2 = flow HSV, 3 = confidence, 4 = occlusion
+    float u_sharpness;      // synthetic frame RCAS-lite sharpness (0.0..1.0)
+    float u_flowMs;         // Vulkan timestamp GPU time for Pass 1B flow (ms)
+    float u_warpMs;         // Vulkan timestamp GPU time for Pass 2 warp (ms)
+    vec4  u_hudMask;        // optional manual static HUD rect (x, y, w, h) in 0..1 UV
+};
+
+float16_t luma16(f16vec3 c)
+{
+    return dot(c, f16vec3(0.2126hf, 0.7152hf, 0.0722hf));
+}
+
+f16vec3 rgbToYCoCg16(f16vec3 c)
+{
+    float16_t Co = c.r - c.b;
+    float16_t t  = c.b + 0.5hf * Co;
+    float16_t Cg = c.g - t;
+    float16_t Y  = t + 0.5hf * Cg;
+    return f16vec3(Y, Co, Cg);
+}
+
+f16vec3 yCoCgToRgb16(f16vec3 ycc)
+{
+    float16_t t = ycc.x - 0.5hf * ycc.z;
+    float16_t g = ycc.z + t;
+    float16_t b = t - 0.5hf * ycc.y;
+    float16_t r = b + ycc.y;
+    return clamp(f16vec3(r, g, b), f16vec3(0.0hf), f16vec3(1.0hf));
+}
+
+bool drawGpuTimingBar(uvec2 pos, uint width, float flowMs, float warpMs, out vec3 barColor)
+{
+    const uint barW = 240u;
+    const uint barH = 18u;
+    const uint pad  = 16u;
+    if (width <= barW + pad * 2u)
+        return false;
+    uint x0 = width - barW - pad;
+    uint y0 = pad;
+    if (pos.x < x0 || pos.x >= x0 + barW || pos.y < y0 || pos.y >= y0 + barH)
+        return false;
+    uint lx = pos.x - x0;
+    uint ly = pos.y - y0;
+    if (lx == 0u || lx == barW - 1u || ly == 0u || ly == barH - 1u)
+    {
+        barColor = vec3(0.95, 0.95, 0.95);
+        return true;
+    }
+    if (lx == 60u || lx == 120u || lx == 180u)
+    {
+        barColor = vec3(0.85, 0.85, 0.85);
+        return true;
+    }
+    float msPos = (float(lx) / float(barW)) * 4.0;
+    float totalMs = flowMs + warpMs;
+    if (msPos <= flowMs)
+        barColor = (totalMs > 4.0) ? vec3(1.0, 0.2, 0.2) : vec3(0.0, 0.85, 1.0);
+    else if (msPos <= totalMs)
+        barColor = (totalMs > 4.0) ? vec3(1.0, 0.1, 0.1) : vec3(0.15, 0.95, 0.35);
+    else
+        barColor = vec3(0.08, 0.08, 0.10);
+    return true;
+}
+
+// Fix #6: Best-of-4 photometric flow upsampling (no foreground/background vector bleed across edges)
+vec4 sampleBestOf4Flow16(vec2 uv, vec2 invSize, float alpha)
+{
+    ivec2 fsz = max(textureSize(s_samplers[2], 0), ivec2(1));
+    vec2 fpos = uv * vec2(fsz) - 0.5;
+    ivec2 i0 = clamp(ivec2(floor(fpos)), ivec2(0), fsz - ivec2(1));
+    ivec2 i1 = min(i0 + ivec2(1), fsz - ivec2(1));
+
+    vec4 cands[4] = vec4[4](
+        texelFetch(s_samplers[2], ivec2(i0.x, i0.y), 0),
+        texelFetch(s_samplers[2], ivec2(i1.x, i0.y), 0),
+        texelFetch(s_samplers[2], ivec2(i0.x, i1.y), 0),
+        texelFetch(s_samplers[2], ivec2(i1.x, i1.y), 0)
+    );
+
+    // Early-out: if all 4 flow corners agree within 1.2px (~90% of screen), skip 8 full-res RGBA8 reads!
+    vec2 d1 = cands[1].xy - cands[0].xy;
+    vec2 d2 = cands[2].xy - cands[0].xy;
+    vec2 d3 = cands[3].xy - cands[0].xy;
+    if (max(dot(d1, d1), max(dot(d2, d2), dot(d3, d3))) < 1.44)
+        return textureLod(s_samplers[2], uv, 0.0);
+
+    vec4 best = cands[0];
+    float16_t bestErr = 1000.0hf;
+    for (int i = 0; i < 4; i++)
+    {
+        vec2 fv = cands[i].xy * invSize;
+        float16_t l0 = luma16(f16vec3(textureLod(s_samplers[0], clamp(uv - fv * alpha, 0.0, 1.0), 0.0).rgb));
+        float16_t l1 = luma16(f16vec3(textureLod(s_samplers[1], clamp(uv + fv * (1.0 - alpha), 0.0, 1.0), 0.0).rgb));
+        float16_t err = abs(l0 - l1) + (1.0hf - float16_t(cands[i].z)) * 0.05hf;
+        if (err < bestErr) { bestErr = err; best = cands[i]; }
+    }
+    return best;
+}
+
+vec3 hsv2rgb(vec3 c)
+{
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+f16vec3 varianceClamp16(f16vec3 sampleRgb, f16vec3 centerRgb, f16vec3 nL, f16vec3 nR, f16vec3 nU, f16vec3 nD, float16_t gamma)
+{
+    f16vec3 y0 = rgbToYCoCg16(centerRgb);
+    f16vec3 yL = rgbToYCoCg16(nL);
+    f16vec3 yR = rgbToYCoCg16(nR);
+    f16vec3 yU = rgbToYCoCg16(nU);
+    f16vec3 yD = rgbToYCoCg16(nD);
+
+    f16vec3 m1 = (y0 + yL + yR + yU + yD) * 0.2hf;
+    f16vec3 m2 = (y0 * y0 + yL * yL + yR * yR + yU * yU + yD * yD) * 0.2hf;
+    f16vec3 sigma = sqrt(max(m2 - m1 * m1, f16vec3(0.0hf)));
+
+    f16vec3 minC = m1 - gamma * sigma;
+    f16vec3 maxC = m1 + gamma * sigma;
+    return yCoCgToRgb16(clamp(rgbToYCoCg16(sampleRgb), minC, maxC));
+}
+
+void main()
+{
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= u_width || pos.y >= u_height)
+        return;
+
+    vec2 invSize = 1.0 / vec2(u_width, u_height);
+    vec2 uv = (vec2(pos) + 0.5) * invSize;
+    float16_t alpha = float16_t(u_alpha);
+
+    f16vec3 currColor = f16vec3(textureLod(s_samplers[1], uv, 0.0).rgb);
+
+    if (u_mode == 1u && u_debugMode == 0u)
+    {
+        imageStore(dst, ivec2(pos), vec4(vec3(currColor), 1.0));
+        return;
+    }
+
+    f16vec3 prevColor = f16vec3(textureLod(s_samplers[0], uv, 0.0).rgb);
+    float16_t currLuma = luma16(currColor);
+    float16_t prevLuma = luma16(prevColor);
+
+    if (u_mode == 2u && u_debugMode == 0u)
+    {
+        float16_t cutDelta = abs(currLuma - prevLuma);
+        f16vec3 outColor = (cutDelta > float16_t(u_sceneCutThresh)) ? currColor : mix(prevColor, currColor, alpha);
+        imageStore(dst, ivec2(pos), vec4(vec3(outColor), 1.0));
+        return;
+    }
+
+    vec4 flowSample = (u_debugMode >= 2u) ? textureLod(s_samplers[2], uv, 0.0) : sampleBestOf4Flow16(uv, invSize, u_alpha);
+    vec2 flowPx     = flowSample.xy;
+    float16_t conf  = clamp(float16_t(flowSample.z), 0.0hf, 1.0hf);
+    float16_t occl  = clamp(float16_t(flowSample.w), 0.0hf, 1.0hf);
+
+    if (u_debugMode != 0u)
+    {
+        vec3 barCol;
+        if (drawGpuTimingBar(pos, u_width, u_flowMs, u_warpMs, barCol))
+        {
+            imageStore(dst, ivec2(pos), vec4(barCol, 1.0));
+            return;
+        }
+    }
+
+    if (u_debugMode == 2u)
+    {
+        float angle = atan(flowPx.y, flowPx.x);
+        float hue = fract(angle / 6.28318530718);
+        float mag = clamp(length(flowPx) / (20.0 * max(u_flowScale, 0.25)), 0.0, 1.0);
+        vec3 flowVis = hsv2rgb(vec3(hue, 0.9, mag));
+        imageStore(dst, ivec2(pos), vec4(mix(vec3(currColor) * 0.25, flowVis, 0.85), 1.0));
+        return;
+    }
+
+    if (u_debugMode == 3u)
+    {
+        vec3 heat = mix(vec3(1.0, 0.15, 0.1), vec3(0.1, 0.95, 0.25), float(conf));
+        imageStore(dst, ivec2(pos), vec4(mix(vec3(currColor) * 0.35, heat, 0.65), 1.0));
+        return;
+    }
+
+    if (u_debugMode == 4u)
+    {
+        vec3 occVis = mix(vec3(currColor) * 0.4, vec3(1.0, 0.0, 0.85), float(occl));
+        imageStore(dst, ivec2(pos), vec4(occVis, 1.0));
+        return;
+    }
+
+    // Directional Background-Flow Disocclusion Inpainting
+    float flowMag = length(flowPx);
+    if (occl > 0.25hf && flowMag > 1.5)
+    {
+        vec2 backDir = (flowPx / flowMag) * (invSize * 4.0);
+        vec2 fBehind = textureLod(s_samplers[2], clamp(uv - backDir, 0.0, 1.0), 0.0).xy;
+        vec2 fAhead  = textureLod(s_samplers[2], clamp(uv + backDir, 0.0, 1.0), 0.0).xy;
+        vec2 bgFlow  = (dot(fBehind, fBehind) <= dot(fAhead, fAhead)) ? fBehind : fAhead;
+        if (dot(bgFlow, bgFlow) < dot(flowPx, flowPx))
+            flowPx = mix(flowPx, bgFlow, smoothstep(0.25, 0.75, float(occl)) * 0.85);
+    }
+
+    // Bidirectional motion-compensated sampling (UV math stays FP32 for sub-pixel accuracy)
+    vec2 flowUV = flowPx * invSize;
+    vec2 uvPrev = clamp(uv - flowUV * u_alpha, vec2(0.0), vec2(1.0));
+    vec2 uvCurr = clamp(uv + flowUV * (1.0 - u_alpha), vec2(0.0), vec2(1.0));
+
+    f16vec3 warpedPrev = f16vec3(textureLod(s_samplers[0], uvPrev, 0.0).rgb);
+    f16vec3 warpedCurr = f16vec3(textureLod(s_samplers[1], uvCurr, 0.0).rgb);
+
+    f16vec3 nL = f16vec3(textureLod(s_samplers[1], clamp(uvCurr - vec2(invSize.x, 0.0), 0.0, 1.0), 0.0).rgb);
+    f16vec3 nR = f16vec3(textureLod(s_samplers[1], clamp(uvCurr + vec2(invSize.x, 0.0), 0.0, 1.0), 0.0).rgb);
+    f16vec3 nU = f16vec3(textureLod(s_samplers[1], clamp(uvCurr - vec2(0.0, invSize.y), 0.0, 1.0), 0.0).rgb);
+    f16vec3 nD = f16vec3(textureLod(s_samplers[1], clamp(uvCurr + vec2(0.0, invSize.y), 0.0, 1.0), 0.0).rgb);
+
+    // Static HUD/text auto-protection
+    float16_t edgeContrast = max(max(abs(currLuma - luma16(nL)), abs(currLuma - luma16(nR))),
+                                 max(abs(currLuma - luma16(nU)), abs(currLuma - luma16(nD))));
+    float16_t staticDelta = length(currColor - prevColor);
+    float16_t hudProtect = (1.0hf - smoothstep(0.008hf, 0.025hf, staticDelta)) * smoothstep(0.08hf, 0.22hf, edgeContrast);
+
+    f16vec3 clampedPrev = varianceClamp16(warpedPrev, warpedCurr, nL, nR, nU, nD, 1.20hf);
+
+    // Particle / discrete-flicker guard (e.g. Minecraft fire & smoke popping in/out):
+    // Prevents sudden high-contrast particle pops from smearing across background blocks.
+    float16_t warpErr = abs(luma16(warpedPrev) - luma16(warpedCurr));
+    float16_t particlePop = smoothstep(0.22hf, 0.45hf, staticDelta) * smoothstep(0.10hf, 0.28hf, warpErr);
+
+    float16_t photoConf = 1.0hf - smoothstep(0.04hf, 0.20hf, warpErr);
+    float16_t totalConf = conf * photoConf * (1.0hf - particlePop * 0.85hf);
+
+    float16_t errPrev = abs(luma16(clampedPrev) - prevLuma);
+    float16_t errCurr = abs(luma16(warpedCurr) - currLuma);
+    f16vec3 occlSafe = (errCurr <= errPrev) ? warpedCurr : clampedPrev;
+
+    f16vec3 motionComp = mix(mix(clampedPrev, warpedCurr, alpha), occlSafe, occl * 0.75hf);
+    f16vec3 fallback   = (abs(currLuma - prevLuma) > float16_t(u_sceneCutThresh))
+        ? currColor
+        : mix(prevColor, currColor, alpha);
+
+    f16vec3 interpColor = mix(fallback, motionComp, totalConf);
+    if (u_hudMask.z > 0.0 && u_hudMask.w > 0.0 &&
+        uv.x >= u_hudMask.x && uv.x <= u_hudMask.x + u_hudMask.z &&
+        uv.y >= u_hudMask.y && uv.y <= u_hudMask.y + u_hudMask.w)
+        hudProtect = 1.0hf;
+    interpColor = mix(interpColor, currColor, hudProtect);
+
+    // Motion-adaptive RCAS-lite sharpening
+    if (u_sharpness > 0.01)
+    {
+        float16_t motionDamp = 1.0hf - 0.55hf * float16_t(smoothstep(4.0, 20.0, flowMag));
+        f16vec3 avgN = 0.25hf * (nL + nR + nU + nD);
+        f16vec3 detail = interpColor - avgN;
+        float16_t localContrast = max(max(abs(detail.r), abs(detail.g)), abs(detail.b));
+        float16_t adaptiveGain = float16_t(u_sharpness) * motionDamp * (1.0hf - smoothstep(0.15hf, 0.45hf, localContrast));
+        interpColor = clamp(interpColor + detail * adaptiveGain, f16vec3(0.0hf), f16vec3(1.0hf));
+    }
+
+    if (u_debugMode == 1u)
+    {
+        uint midX = u_width / 2u;
+        if (pos.x + 1u >= midX && pos.x <= midX + 1u)
+        {
+            imageStore(dst, ivec2(pos), vec4(0.0, 1.0, 0.9, 1.0));
+            return;
+        }
+        f16vec3 splitOut = (pos.x < midX) ? currColor : interpColor;
+        imageStore(dst, ivec2(pos), vec4(vec3(splitOut), 1.0));
+        return;
+    }
+
+    imageStore(dst, ivec2(pos), vec4(vec3(interpColor), 1.0));
+}

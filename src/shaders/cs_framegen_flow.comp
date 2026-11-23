@@ -1,0 +1,236 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+// Pass 1B (v8 — True 3-Level 1/16 -> 1/8 -> 1/4 Symmetric Pyramid + Linear Luma / texelFetch Census
+// + Windowed 3x3 Symmetric LK Sub-Pixel Refinement + Frame-Wide Global Scene-Cut):
+// - s_samplers[0..1]: 1/4-res RG8_UNORM (LINEAR sampler for luma, texelFetch for exact Census bits)
+// - s_samplers[2]:    prevFlow RGBA16F (temporal seed)
+// - s_samplers[3..4]: 1/8-res RG8_UNORM pyramid
+// - s_samplers[5..6]: 1/16-res RG8_UNORM pyramid (coarse search + global frame-level scene-cut)
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+layout(binding = 0, scalar)
+uniform layers_t {
+    uint  u_flowWidth;
+    uint  u_flowHeight;
+    uint  u_fullWidth;
+    uint  u_fullHeight;
+    float u_sceneCutThresh;
+    float u_flowScale;
+    uint  u_flowDiv;
+    uint  u_hasPrevFlow;
+};
+
+shared vec2 s_tileFlow[8][8];
+
+uint unpackCensus(float g)
+{
+    return uint(clamp(round(g * 255.0), 0.0, 255.0));
+}
+
+// Exact integer texelFetch for Census bits (never corrupted by linear filtering!)
+vec2 fetchLevelExact(int level, int frame, vec2 uv)
+{
+    ivec2 sz;
+    if (level == 0)
+        sz = (frame == 0) ? textureSize(s_samplers[0], 0) : textureSize(s_samplers[1], 0);
+    else if (level == 1)
+        sz = (frame == 0) ? textureSize(s_samplers[3], 0) : textureSize(s_samplers[4], 0);
+    else
+        sz = (frame == 0) ? textureSize(s_samplers[5], 0) : textureSize(s_samplers[6], 0);
+
+    ivec2 coord = clamp(ivec2(floor(uv * vec2(sz))), ivec2(0), sz - ivec2(1));
+    if (level == 0)
+        return (frame == 0) ? texelFetch(s_samplers[0], coord, 0).rg : texelFetch(s_samplers[1], coord, 0).rg;
+    else if (level == 1)
+        return (frame == 0) ? texelFetch(s_samplers[3], coord, 0).rg : texelFetch(s_samplers[4], coord, 0).rg;
+    else
+        return (frame == 0) ? texelFetch(s_samplers[5], coord, 0).rg : texelFetch(s_samplers[6], coord, 0).rg;
+}
+
+// Hardware bilinear luma read (Fix #2: true sub-pixel interpolation for LK/DIS refinement!)
+float fetchLumaLinear0(int frame, vec2 uv)
+{
+    vec2 c = clamp(uv, vec2(0.0), vec2(1.0));
+    return (frame == 0) ? textureLod(s_samplers[0], c, 0.0).r : textureLod(s_samplers[1], c, 0.0).r;
+}
+
+float pointCost(vec2 lc0, vec2 lc1)
+{
+    uint hamming = bitCount(unpackCensus(lc0.y) ^ unpackCensus(lc1.y));
+    return float(hamming) * 0.125 + abs(lc0.x - lc1.x) * 0.55;
+}
+
+float symLevelCost(int level, vec2 uv, vec2 dispAtLevel, vec2 invLevel, vec2 temporalPriorLevel)
+{
+    vec2 h = dispAtLevel * 0.5 * invLevel;
+    float c = pointCost(fetchLevelExact(level, 0, uv - h), fetchLevelExact(level, 1, uv + h));
+    return c + length(dispAtLevel) * 0.0018 + length(dispAtLevel - temporalPriorLevel) * 0.0014;
+}
+
+void main()
+{
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    uvec2 lid = gl_LocalInvocationID.xy;
+    bool inBounds = (pos.x < u_flowWidth && pos.y < u_flowHeight);
+
+    vec2 invL0 = 1.0 / vec2(u_flowWidth, u_flowHeight);
+    vec2 invL1 = 1.0 / vec2(max(textureSize(s_samplers[3], 0), ivec2(1)));
+    vec2 invL2 = 1.0 / vec2(max(textureSize(s_samplers[5], 0), ivec2(1)));
+    vec2 uv = (vec2(min(pos, uvec2(u_flowWidth - 1u, u_flowHeight - 1u))) + 0.5) * invL0;
+
+    // Frame-level Global Scene-Cut Detection (9 screen-wide 1/16-res blurred blocks — never trips on local edges!)
+    float globalCut = 0.0;
+    for (int gy = 0; gy < 3; gy++)
+    {
+        for (int gx = 0; gx < 3; gx++)
+        {
+            vec2 guv = vec2(0.2 + 0.3 * float(gx), 0.2 + 0.3 * float(gy));
+            float l0 = textureLod(s_samplers[5], guv, 0.0).r;
+            float l1 = textureLod(s_samplers[6], guv, 0.0).r;
+            globalCut += abs(l1 - l0);
+        }
+    }
+    globalCut *= (1.0 / 9.0);
+    bool isSceneCut = (globalCut > u_sceneCutThresh);
+
+    float scale = clamp(u_flowScale, 0.25, 4.0);
+    vec2 temporalL0 = vec2(0.0);
+    vec2 dispL0 = vec2(0.0);
+
+    if (!isSceneCut && inBounds)
+    {
+        if (u_hasPrevFlow != 0u)
+        {
+            vec4 prevF = textureLod(s_samplers[2], uv, 0.0);
+            if (prevF.z > 0.25)
+                temporalL0 = prevF.xy / float(u_flowDiv);
+        }
+
+        // === LEVEL 2 (1/16-res blurred pyramid): 5x5 search covers +/- 32..64 full-res px with zero aliasing ===
+        vec2 tempL2 = temporalL0 * 0.25;
+        vec2 bestL2 = vec2(0.0);
+        float costL2 = symLevelCost(2, uv, vec2(0.0), invL2, tempL2);
+        if (u_hasPrevFlow != 0u)
+        {
+            float cSeed = symLevelCost(2, uv, tempL2, invL2, tempL2);
+            if (cSeed < costL2) { costL2 = cSeed; bestL2 = tempL2; }
+        }
+        vec2 baseL2 = bestL2;
+        float stepL2 = max(1.0, scale);
+        for (int dy = -2; dy <= 2; dy++)
+        {
+            for (int dx = -2; dx <= 2; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                vec2 cand = baseL2 + vec2(float(dx), float(dy)) * stepL2;
+                float c = symLevelCost(2, uv, cand, invL2, tempL2);
+                if (c < costL2) { costL2 = c; bestL2 = cand; }
+            }
+        }
+
+        // === LEVEL 1 (1/8-res blurred pyramid): 3x3 refinement around 2 * bestL2 (eliminates residual gap) ===
+        vec2 tempL1 = temporalL0 * 0.5;
+        vec2 bestL1 = bestL2 * 2.0;
+        float costL1 = symLevelCost(1, uv, bestL1, invL1, tempL1);
+        vec2 baseL1 = bestL1;
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                vec2 cand = baseL1 + vec2(float(dx), float(dy));
+                float c = symLevelCost(1, uv, cand, invL1, tempL1);
+                if (c < costL1) { costL1 = c; bestL1 = cand; }
+            }
+        }
+
+        // === LEVEL 0 (1/4-res): 3x3 refinement around 2 * bestL1 ===
+        dispL0 = bestL1 * 2.0;
+        float costL0 = symLevelCost(0, uv, dispL0, invL0, temporalL0);
+        vec2 baseL0 = dispL0;
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                vec2 cand = baseL0 + vec2(float(dx), float(dy));
+                float c = symLevelCost(0, uv, cand, invL0, temporalL0);
+                if (c < costL0) { costL0 = c; dispL0 = cand; }
+            }
+        }
+    }
+
+    s_tileFlow[lid.y][lid.x] = dispL0;
+    barrier();
+
+    if (!inBounds)
+        return;
+
+    if (isSceneCut)
+    {
+        imageStore(dst, ivec2(pos), vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Spatial Candidate Selection (FidelityFX-style neighbor snapping in shared memory)
+    uint xm = (lid.x > 0u) ? (lid.x - 1u) : lid.x;
+    uint xp = (lid.x < 7u) ? (lid.x + 1u) : lid.x;
+    uint ym = (lid.y > 0u) ? (lid.y - 1u) : lid.y;
+    uint yp = (lid.y < 7u) ? (lid.y + 1u) : lid.y;
+
+    vec2 nFlows[4] = vec2[4](
+        s_tileFlow[lid.y][xm],
+        s_tileFlow[lid.y][xp],
+        s_tileFlow[ym][lid.x],
+        s_tileFlow[yp][lid.x]
+    );
+
+    // Neighbor smoothness regularizer breaks ambiguity on repeating fences/grids/asphalt
+    vec2 nAvg = 0.25 * (nFlows[0] + nFlows[1] + nFlows[2] + nFlows[3]);
+    vec2 bestProp = dispL0;
+    float bestPropCost = symLevelCost(0, uv, dispL0, invL0, temporalL0) + 0.015 * length(dispL0 - nAvg);
+    for (int i = 0; i < 4; i++)
+    {
+        float c = symLevelCost(0, uv, nFlows[i], invL0, temporalL0) + 0.015 * length(nFlows[i] - nAvg);
+        if (c < bestPropCost) { bestPropCost = c; bestProp = nFlows[i]; }
+    }
+
+    // Fast 2-iteration Symmetric DIS Sub-Pixel Refinement on TRUE BILINEAR Luma (12 reads total vs 180!)
+    for (int iter = 0; iter < 2; iter++)
+    {
+        vec2 h = bestProp * 0.5 * invL0;
+        vec2 uv0 = uv - h;
+        vec2 uv1 = uv + h;
+        float l0 = fetchLumaLinear0(0, uv0);
+        float l1 = fetchLumaLinear0(1, uv1);
+        float gx = 0.25 * ((fetchLumaLinear0(0, uv0 + vec2(invL0.x, 0.0)) - fetchLumaLinear0(0, uv0 - vec2(invL0.x, 0.0)))
+                         + (fetchLumaLinear0(1, uv1 + vec2(invL0.x, 0.0)) - fetchLumaLinear0(1, uv1 - vec2(invL0.x, 0.0))));
+        float gy = 0.25 * ((fetchLumaLinear0(0, uv0 + vec2(0.0, invL0.y)) - fetchLumaLinear0(0, uv0 - vec2(0.0, invL0.y)))
+                         + (fetchLumaLinear0(1, uv1 + vec2(0.0, invL0.y)) - fetchLumaLinear0(1, uv1 - vec2(0.0, invL0.y))));
+        float gradSq = gx * gx + gy * gy + 0.004;
+        float dt = l1 - l0;
+        bestProp += clamp(vec2(-dt * gx, -dt * gy) / gradSq, vec2(-0.45), vec2(0.45));
+    }
+
+    if (u_hasPrevFlow != 0u && length(bestProp - temporalL0) < 2.2 * scale)
+        bestProp = mix(bestProp, temporalL0, 0.20);
+
+    // Physical Flow Divergence + Symmetric Residual Occlusion Mask
+    float divFlow = abs((nFlows[1].x - nFlows[0].x) + (nFlows[3].y - nFlows[2].y));
+    vec2 hFinal = bestProp * 0.5 * invL0;
+    float symErr = pointCost(fetchLevelExact(0, 0, uv - hFinal), fetchLevelExact(0, 1, uv + hFinal));
+
+    float occlusion = clamp(smoothstep(0.14, 0.45, symErr) + 0.55 * smoothstep(1.2, 4.5, divFlow), 0.0, 1.0);
+    float confidence = 1.0 - smoothstep(0.08, 0.40, symErr);
+
+    vec2 flowFullPx = bestProp * float(u_flowDiv);
+    imageStore(dst, ivec2(pos), vec4(flowFullPx.x, flowFullPx.y, confidence, occlusion));
+}

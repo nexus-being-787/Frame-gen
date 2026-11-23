@@ -1,0 +1,32 @@
+# Maintainer: G. Lakshmi Narayanan
+pkgname=gamescope-framegen-intel-git
+pkgver=3.16.0.fg9
+pkgrel=1
+pkgdesc="Valve Gamescope with low-overhead Vulkan compute Frame Generation tuned for Intel Xe-LP/UHD"
+arch=('x86_64')
+url="https://github.com/ValveSoftware/gamescope"
+license=('BSD-2-Clause')
+depends=(
+  'wayland' 'libdrm' 'libinput' 'libxkbcommon' 'pixman' 'sdl2' 'pipewire'
+  'luajit' 'libavif' 'libcap' 'libeis' 'libdecor' 'libdisplay-info'
+  'libliftoff' 'wlroots' 'vulkan-icd-loader' 'xorg-xwayland'
+  'libx11' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxi'
+  'libxmu' 'libxrender' 'libxres' 'libxtst' 'libxxf86vm' 'libxcursor'
+)
+makedepends=('meson' 'ninja' 'pkgconf' 'glslang' 'vulkan-headers' 'wayland-protocols' 'stb' 'glm' 'xorgproto')
+provides=('gamescope')
+conflicts=('gamescope')
+
+build() {
+  export CFLAGS="${CFLAGS} -O3 -march=native"
+  export CXXFLAGS="${CXXFLAGS} -O3 -march=native"
+  arch-meson "${startdir}/../.." build \
+    -Dpipewire=enabled \
+    -Dbenchmark=disabled
+  ninja -C build
+}
+
+package() {
+  DESTDIR="${pkgdir}" ninja -C build install
+  install -Dm644 "${startdir}/../../LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

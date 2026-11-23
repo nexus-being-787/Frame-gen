@@ -1,0 +1,114 @@
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+// Pass 4B (v3): Complete shared-memory tiled, zero-padded, residual-skip DP4a compute kernel.
+// Uses IEEE roundEven() + `precise` arithmetic (no FMA contraction drift) to match PyTorch QAT within +/-1 LSB.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint  u_width;       // 1/8-res width (160 @ 720p pre-FSR)
+    uint  u_height;      // 1/8-res height (90 @ 720p pre-FSR)
+    uint  u_inCh4;       // in_ch / 4 (max 6)
+    uint  u_outCh4;      // out_ch / 4
+    uint  u_wOff;        // int32 element offset in WeightBuf
+    uint  u_sOff;        // float element offset in ParamBuf (scales)
+    uint  u_bOff;        // float element offset in ParamBuf (biases)
+    uint  u_actMode;     // 0 = final sigmoid head -> dstMask, 1 = ReLU6 -> outAct, 2 = residual skipAct + ReLU6 -> outAct
+    float u_inScale;     // fixed INPUT_SCALE (1/127) or RELU6_SCALE (6/127)
+    float u_outInvScale; // 127/6 for ReLU6 layers
+    float u_skipScale;   // RELU6_SCALE for residual skip layer
+    uint  u_pad0;
+};
+
+layout(set = 1, std430, binding = 0) readonly  buffer InActBuf  { int   inAct[];   };
+layout(set = 1, std430, binding = 1) writeonly buffer OutActBuf { int   outAct[];  };
+layout(set = 1, std430, binding = 2) readonly  buffer WeightBuf { int   weights[]; };
+layout(set = 1, std430, binding = 3) readonly  buffer ParamBuf  { float params[];  };
+layout(set = 1, std430, binding = 4) readonly  buffer SkipBuf   { int   skipAct[]; };
+layout(set = 1, binding = 5) writeonly uniform image2D dstMask;
+
+shared int s_tile[10][10][6];
+
+void main()
+{
+    uvec2 lid = gl_LocalInvocationID.xy;
+    uint linearId = lid.y * 8u + lid.x;
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy * uvec2(8u, 8u));
+
+    for (uint idx = linearId; idx < 100u; idx += 64u)
+    {
+        uint sy = idx / 10u;
+        uint sx = idx % 10u;
+        int gx = tileOrigin.x + int(sx) - 1;
+        int gy = tileOrigin.y + int(sy) - 1;
+        bool valid = (gx >= 0 && gx < int(u_width) && gy >= 0 && gy < int(u_height));
+        uint baseOff = valid ? ((uint(gy) * u_width + uint(gx)) * u_inCh4) : 0u;
+        for (uint c4 = 0u; c4 < u_inCh4; c4++)
+            s_tile[sy][sx][c4] = valid ? inAct[baseOff + c4] : 0;
+    }
+    barrier();
+
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    if (ox >= u_width || oy >= u_height)
+        return;
+
+    uint pixelIdx = oy * u_width + ox;
+
+    for (uint oc4 = 0u; oc4 < u_outCh4; oc4++)
+    {
+        int skipPacked = (u_actMode == 2u) ? skipAct[pixelIdx * u_outCh4 + oc4] : 0;
+        int packedOut = 0;
+        vec4 headOut = vec4(0.0);
+
+        for (uint lane = 0u; lane < 4u; lane++)
+        {
+            uint oc = oc4 * 4u + lane;
+            int acc = 0;
+            uint wBase = u_wOff + oc * 9u * u_inCh4;
+
+            for (uint ky = 0u; ky < 3u; ky++)
+            {
+                for (uint kx = 0u; kx < 3u; kx++)
+                {
+                    uint wTap = wBase + (ky * 3u + kx) * u_inCh4;
+                    for (uint ic4 = 0u; ic4 < u_inCh4; ic4++)
+                    {
+                        acc += dotPacked4x8EXT(s_tile[lid.y + ky][lid.x + kx][ic4], weights[wTap + ic4]);
+                    }
+                }
+            }
+
+            // `precise` disables FMA contraction so float dequant matches CPU/PyTorch reference within +/-1 LSB
+            precise float prod = float(acc) * (u_inScale * params[u_sOff + oc]);
+            precise float val  = prod + params[u_bOff + oc];
+
+            if (u_actMode == 2u)
+            {
+                int skipByte = bitfieldExtract(skipPacked, int(lane * 8u), 8);
+                precise float skipVal = float(skipByte) * u_skipScale;
+                val = val + skipVal;
+            }
+
+            if (u_actMode == 0u)
+            {
+                headOut[lane] = 1.0 / (1.0 + exp(-val));
+            }
+            else
+            {
+                val = clamp(val, 0.0, 6.0);
+                // roundEven matches IEEE-754 / PyTorch torch.round() bankers rounding
+                int q = clamp(int(roundEven(val * u_outInvScale)), 0, 127);
+                packedOut |= ((q & 0xFF) << (lane * 8u));
+            }
+        }
+
+        if (u_actMode == 0u)
+            imageStore(dstMask, ivec2(ox, oy), headOut);
+        else
+            outAct[pixelIdx * u_outCh4 + oc4] = packedOut;
+    }
+}
